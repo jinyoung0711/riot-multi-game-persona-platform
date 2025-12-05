@@ -1,282 +1,261 @@
-"""
-Riot API 클라이언트 모듈
-
-- 환경변수에서 RIOT_API_KEY, RIOT_REGION, RIOT_LOL_PLATFORM, RIOT_TFT_PLATFORM을 읽어온다.
-- LoL / TFT 매치 데이터를 가져오기 위한 공통 클라이언트를 제공한다.
-"""
+# scripts/riot_client.py
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, Optional
+from dotenv import load_dotenv
 import requests
-
-# (옵션) .env 지원 - python-dotenv가 설치되어 있으면 자동으로 .env를 읽는다.
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    # 개발 초기 단계에서는 굳이 의존성 강제하지 않고, 없으면 그냥 넘어간다.
-    pass
-
-
-# ---------------------------------------------------------------------------
-# 로깅 설정
-# ---------------------------------------------------------------------------
+from requests import Response, Session
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    # 기본 핸들러가 없을 때만 간단 설정
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
-    )
+logging.basicConfig(level=logging.INFO)
 
+load_dotenv()
+class RiotAPIError(Exception):
+    """Riot API 호출 중 발생하는 예외를 래핑하는 커스텀 에러."""
 
-# ---------------------------------------------------------------------------
-# 설정 & 예외 정의
-# ---------------------------------------------------------------------------
 
 @dataclass
-class RiotConfig:
-    """
-    Riot API 설정값을 한 군데에 모아두는 데이터 클래스
-    """
-
+class RiotAPIConfig:
     api_key: str
-    region: str = "asia"        # match-v5, account-v1 등 regional routing (asia, americas, europe...)
-    lol_platform: str = "kr"    # LoL 플랫폼(kr, jp1, na1, ...)
-    tft_platform: str = "ap"    # TFT 플랫폼(ap, kr, na1, ...)
+    region: str          # 예: "asia", "americas", "europe", "sea"
+    lol_platform: str    # 예: "kr", "jp1"
+    tft_platform: str    # 예: "ap", "kr"
 
-    timeout: int = 10           # 요청 타임아웃(초)
-    max_retries: int = 3        # 재시도 횟수
+    @classmethod
+    def from_env(cls) -> "RiotAPIConfig":
+        api_key = os.getenv("RIOT_API_KEY")
+        region = os.getenv("RIOT_REGION", "asia")
+        lol_platform = os.getenv("LOL_PLATFORM", "kr")
+        tft_platform = os.getenv("TFT_PLATFORM", "ap")
 
-
-class RiotAPIError(Exception):
-    """Riot API 호출 중 발생한 오류를 감싸는 예외"""
-
-    def __init__(self, message: str, status_code: Optional[int] = None):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-# ---------------------------------------------------------------------------
-# RiotClient 본체
-# ---------------------------------------------------------------------------
-
-class RiotClient:
-    """
-    Riot Games API용 HTTP 클라이언트
-
-    - 내부적으로 requests.Session을 사용해 커넥션 재사용
-    - _request() 메서드에서 공통 인증/에러 처리/재시도 로직 처리
-    """
-
-    def __init__(self, config: Optional[RiotConfig] = None):
-        # config를 직접 넘겨주지 않으면 환경변수에서 읽어온다.
-        if config is None:
-            api_key = os.getenv("RIOT_API_KEY")
-            if not api_key:
-                raise ValueError(
-                    "RIOT_API_KEY 환경변수가 설정되어 있지 않습니다. "
-                    ".env 또는 쉘 환경에 API 키를 설정하세요."
-                )
-
-            config = RiotConfig(
-                api_key=api_key,
-                region=os.getenv("RIOT_REGION", "asia"),
-                lol_platform=os.getenv("RIOT_LOL_PLATFORM", "kr"),
-                tft_platform=os.getenv("RIOT_TFT_PLATFORM", "ap"),
+        if not api_key:
+            raise ValueError(
+                "RIOT_API_KEY 환경 변수가 설정되어 있지 않습니다. "
+                ".env 파일 또는 시스템 환경 변수에 Riot API 키를 설정해주세요."
             )
 
-        self.config = config
+        return cls(
+            api_key=api_key,
+            region=region,
+            lol_platform=lol_platform,
+            tft_platform=tft_platform,
+        )
 
-        # Session 하나를 공유해서 TCP 커넥션 재사용 (성능 + rate limit에 조금 더 안정적)
-        self.session = requests.Session()
 
-        # Regional / Platform base URL 정의
-        self.base_urls = {
-            "regional": f"https://{self.config.region}.api.riotgames.com",
-            "lol_platform": f"https://{self.config.lol_platform}.api.riotgames.com",
-            "tft_platform": f"https://{self.config.tft_platform}.api.riotgames.com",
+class RiotAPIClient:
+    """
+    Riot API 공통 클라이언트.
+
+    - 재시도 & 백오프 내장
+    - region / platform 기반 base URL 관리
+    - JSON 반환 헬퍼 제공
+    """
+
+    def __init__(
+        self,
+        config: Optional[RiotAPIConfig] = None,
+        session: Optional[Session] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.5,
+        timeout: int = 10,
+    ) -> None:
+        self.config = config or RiotAPIConfig.from_env()
+        self.session: Session = session or requests.Session()
+        self.session.headers.update(
+            {
+                "X-Riot-Token": self.config.api_key,
+            }
+        )
+
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.timeout = timeout
+
+        # region 기반(예: match-v5)
+        self.region_base_url = f"https://{self.config.region}.api.riotgames.com"
+
+        # game별 platform 기반(예: summoner-v4 등)
+        self.platform_base_urls: Dict[str, str] = {
+            "lol": f"https://{self.config.lol_platform}.api.riotgames.com",
+            "tft": f"https://{self.config.tft_platform}.api.riotgames.com",
         }
 
-    # -----------------------------
-    # 내부 유틸 메서드
-    # -----------------------------
-    def _request(self, method: str, url: str, **kwargs) -> Any:
+    # ----------------------------
+    # 내부 공통 요청 로직
+    # ----------------------------
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> Response:
         """
-        Riot API 호출 공통 래퍼
-
-        - 인증 헤더 추가
-        - 429 / 5xx에 대해 간단한 재시도
-        - JSON 응답 반환, 필요 시 RiotAPIError 예외 발생
+        Riot API 요청을 보내고, 429/5xx에 대해 재시도하는 내부 함수.
         """
-        headers = kwargs.pop("headers", {})
-        headers["X-Riot-Token"] = self.config.api_key
+        attempt = 0
 
-        timeout = kwargs.pop("timeout", self.config.timeout)
-
-        last_exc: Optional[Exception] = None
-
-        for attempt in range(1, self.config.max_retries + 1):
+        while True:
             try:
-                resp = self.session.request(
+                logger.debug("Riot API 요청: %s %s | kwargs=%s", method, url, kwargs)
+                response = self.session.request(
                     method=method,
                     url=url,
-                    headers=headers,
-                    timeout=timeout,
+                    timeout=self.timeout,
                     **kwargs,
                 )
+            except requests.RequestException as exc:
+                # 네트워크 에러 시 재시도
+                if attempt >= self.max_retries:
+                    logger.error("Riot API 네트워크 에러 (최대 재시도 초과): %s", exc)
+                    raise RiotAPIError("Riot API 네트워크 에러") from exc
 
-                # Rate limit (429) 처리
-                if resp.status_code == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    wait_seconds = int(retry_after) if retry_after else 2 ** attempt
-                    logger.warning(
-                        "Rate limit(429) 발생. %s초 후 재시도합니다. (attempt=%s)",
-                        wait_seconds,
-                        attempt,
+                backoff = self.backoff_factor * (2**attempt)
+                logger.warning(
+                    "Riot API 네트워크 에러 발생, %.1f초 후 재시도합니다. (attempt=%d/%d)",
+                    backoff,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(backoff)
+                attempt += 1
+                continue
+
+            # Rate limit 및 서버 에러 상태코드
+            if response.status_code in (429, 500, 502, 503, 504):
+                if attempt >= self.max_retries:
+                    logger.error(
+                        "Riot API 에러 %s (최대 재시도 초과): %s",
+                        response.status_code,
+                        response.text,
                     )
-                    time.sleep(wait_seconds)
-                    continue
-
-                # 5xx 서버 에러는 재시도
-                if 500 <= resp.status_code < 600:
-                    logger.warning(
-                        "서버 에러(%s) 발생. 재시도합니다. (attempt=%s)",
-                        resp.status_code,
-                        attempt,
-                    )
-                    time.sleep(2 ** attempt)
-                    continue
-
-                # 그 외 2xx가 아닌 경우는 예외
-                if not resp.ok:
                     raise RiotAPIError(
-                        f"Riot API 요청 실패: {resp.status_code} {resp.text[:200]}",
-                        status_code=resp.status_code,
+                        f"Riot API 에러 {response.status_code}: {response.text}"
                     )
 
-                # 정상 응답 → JSON 반환
-                if "application/json" in resp.headers.get("Content-Type", ""):
-                    return resp.json()
-                return resp.text
+                retry_after_header = response.headers.get("Retry-After")
+                retry_after = float(retry_after_header) if retry_after_header else 0.0
+                backoff = max(retry_after, self.backoff_factor * (2**attempt))
+                logger.warning(
+                    "Riot API 에러 %s, %.1f초 후 재시도합니다. (attempt=%d/%d)",
+                    response.status_code,
+                    backoff,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(backoff)
+                attempt += 1
+                continue
 
-            except (requests.RequestException, RiotAPIError) as exc:
-                last_exc = exc
-                logger.exception("Riot API 요청 중 예외 발생 (attempt=%s)", attempt)
-                # 마지막 시도가 아니라면 잠시 대기 후 재시도
-                if attempt < self.config.max_retries:
-                    time.sleep(2 ** attempt)
-                    continue
+            if not response.ok:
+                logger.error(
+                    "Riot API 요청 실패: %s %s | status=%s | body=%s",
+                    method,
+                    url,
+                    response.status_code,
+                    response.text,
+                )
+                raise RiotAPIError(
+                    f"Riot API 요청 실패: {response.status_code} {response.text}"
+                )
 
-        # 여기까지 왔다는 건 재시도 끝까지 실패했다는 뜻
-        if isinstance(last_exc, RiotAPIError):
-            raise last_exc
-        raise RiotAPIError(f"Riot API 요청 반복 실패: {last_exc}")
+            return response
 
-    # -----------------------------
-    # Account / Summoner 관련 메서드
-    # -----------------------------
-
-    def get_account_by_riot_id(self, game_name: str, tag_line: str) -> Dict[str, Any]:
+    # ----------------------------
+    # 외부에서 사용하는 헬퍼 메서드
+    # ----------------------------
+    def get(
+        self,
+        path: str,
+        *,
+        game: Optional[str] = None,
+        use_region: bool = False,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Riot ID (gameName#tagLine) → account-v1 API로 PUUID 조회
+        GET 요청 헬퍼.
 
-        예: game_name="Hide on bush", tag_line="KR1"
+        - use_region=True 인 경우: region 기반 base URL 사용 (ex. match-v5)
+        - game="lol"/"tft" 인 경우: 게임별 platform 기반 base URL 사용
         """
-        url = (
-            f"{self.base_urls['regional']}"
-            f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-        )
-        return self._request("GET", url)
+        if use_region:
+            base = self.region_base_url
+        else:
+            if not game:
+                raise ValueError("game을 지정하거나 use_region=True로 설정해야 합니다.")
+            if game not in self.platform_base_urls:
+                raise ValueError(f"지원하지 않는 game 타입입니다: {game}")
+            base = self.platform_base_urls[game]
 
-    # -----------------------------
-    # LoL match-v5 메서드
-    # -----------------------------
+        url = f"{base}{path}"
+        response = self._request_with_retry("GET", url, params=params)
+        return response.json()
 
+    # ----------------------------
+    # (예시) 자주 쓰일 수 있는 편의 메서드들
+    # ----------------------------
     def get_lol_match_ids_by_puuid(
-        self, puuid: str, start: int = 0, count: int = 20
-    ) -> List[str]:
+        self,
+        puuid: str,
+        count: int = 20,
+    ) -> list[str]:
         """
-        LoL match-v5: PUUID 기준 match id 리스트 조회
+        LoL match-v5: PUUID 기준 매치 ID 리스트 조회.
         """
-        url = (
-            f"{self.base_urls['regional']}"
-            f"/lol/match/v5/matches/by-puuid/{puuid}/ids"
-        )
-        params = {"start": start, "count": count}
-        return self._request("GET", url, params=params)
+        path = f"/lol/match/v5/matches/by-puuid/{puuid}/ids"
+        params = {"count": count}
+        data = self.get(path, use_region=True, params=params)
+        # match-v5는 리스트를 반환
+        return list(data)
 
-    def get_lol_match_detail(self, match_id: str) -> Dict[str, Any]:
+    def get_lol_match_by_id(self, match_id: str) -> Dict[str, Any]:
         """
-        LoL match-v5: 특정 match id에 대한 상세 정보 조회
+        LoL match-v5: matchId 기준 매치 상세 조회.
         """
-        url = (
-            f"{self.base_urls['regional']}"
-            f"/lol/match/v5/matches/{match_id}"
-        )
-        return self._request("GET", url)
-
-    # -----------------------------
-    # TFT match-v1 메서드 (초안)
-    # -----------------------------
+        path = f"/lol/match/v5/matches/{match_id}"
+        return self.get(path, use_region=True)
 
     def get_tft_match_ids_by_puuid(
-        self, puuid: str, start: int = 0, count: int = 20
-    ) -> List[str]:
+        self,
+        puuid: str,
+        count: int = 20,
+    ) -> list[str]:
         """
-        TFT match-v1: PUUID 기준 match id 리스트 조회
+        TFT match-v1: PUUID 기준 매치 ID 리스트 조회.
+        (실제 엔드포인트/버전은 Riot 문서 확인 후 필요 시 수정)
         """
-        url = (
-            f"{self.base_urls['regional']}"
-            f"/tft/match/v1/matches/by-puuid/{puuid}/ids"
-        )
-        params = {"start": start, "count": count}
-        return self._request("GET", url, params=params)
+        path = f"/tft/match/v1/matches/by-puuid/{puuid}/ids"
+        params = {"count": count}
+        data = self.get(path, use_region=True, params=params)
+        return list(data)
 
-    def get_tft_match_detail(self, match_id: str) -> Dict[str, Any]:
+    def get_tft_match_by_id(self, match_id: str) -> Dict[str, Any]:
         """
-        TFT match-v1: 특정 match id에 대한 상세 정보 조회
+        TFT match-v1: matchId 기준 매치 상세 조회.
         """
-        url = (
-            f"{self.base_urls['regional']}"
-            f"/tft/match/v1/matches/{match_id}"
-        )
-        return self._request("GET", url)
-
-
-# ---------------------------------------------------------------------------
-# 간단 사용 예시 (직접 실행 시)
-# ---------------------------------------------------------------------------
-
-def _example_usage() -> None:
-    """
-    python scripts/riot_client.py 를 직접 실행했을 때 동작하는 예제
-
-    주의: 실제로 테스트하려면 PUUID 또는 Riot ID를 본인 것으로 바꿔야 한다.
-    """
-    client = RiotClient()
-
-    # 1) Riot ID → PUUID
-    # 실제 Riot ID로 바꿔서 테스트
-    # account = client.get_account_by_riot_id("게임아이디", "KR1")
-    # print("Account:", account)
-
-    # 2) PUUID 기준 LoL match id 조회 예시 (가짜 값이므로 그냥 구조만 확인용)
-    sample_puuid = "PUT-YOUR-PUUID-HERE"
-    try:
-        match_ids = client.get_lol_match_ids_by_puuid(sample_puuid, count=5)
-        print("LoL match ids:", match_ids)
-    except RiotAPIError as e:
-        print("API 호출 실패:", e)
+        path = f"/tft/match/v1/matches/{match_id}"
+        return self.get(path, use_region=True)
 
 
 if __name__ == "__main__":
-    _example_usage()
+    """
+    간단 수동 테스트용 엔트리포인트.
+    - .env에 환경변수 세팅 후
+    - python -m scripts.riot_client
+      로 실행하면 클라이언트가 초기화되는지만 확인.
+    """
+    try:
+        client = RiotAPIClient()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("RiotAPIClient 초기화 실패: %s", exc)
+    else:
+        logger.info(
+            "RiotAPIClient 초기화 성공 - region=%s, lol_platform=%s, tft_platform=%s",
+            client.config.region,
+            client.config.lol_platform,
+            client.config.tft_platform,
+        )
